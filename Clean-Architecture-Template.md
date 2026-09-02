@@ -1,6 +1,6 @@
 # Clean Architecture + CQRS .NET Template Guide
 
-A genericized reference distilled from a production multi-tenant .NET 10 Web API on **SQL Server**. Use this as an example to bootstrap a **brand-new** project with the same architecture — it contains structure, conventions, and file templates, not business logic. Every example below uses placeholder names (`YourApp`, `Product`) — replace with your real solution/company/domain names.
+A genericized reference distilled from a production multi-tenant .NET 10 Web API on **SQL Server**. Use this to bootstrap a **brand-new** project with the same architecture — it contains structure, conventions, and file templates, not business logic. Every example below uses placeholder names (`YourApp`, `Product`) — replace with your real solution/company/domain names.
 
 Hand this file to an agent (or a new teammate) with the instruction: *"Set up a new solution following this guide."*
 
@@ -8,7 +8,7 @@ Hand this file to an agent (or a new teammate) with the instruction: *"Set up a 
 
 ## 1. Architectural style
 
-**Clean Architecture + CQRS + Repository/Unit-of-Work**, strict inward dependency direction:
+**Clean Architecture + CQRS + Repository/Unit-of-Work**, strict inward dependency direction: layering keeps business logic testable without a database or web server running, CQRS lets reads and writes evolve independently, and Repository/UoW gives every write a single consistent commit point.
 
 ```
 Domain  ←  Application  ←  Infrastructure[.Tenant]  ←  WebAPI
@@ -1369,12 +1369,3 @@ Don't introduce a Result-pattern library (`OneOf`, `FluentResults`, `ErrorOr`) �
 - §6c's `tableName`/`keyColumnName`/column-name interpolation into `CREATE TABLE`/`MERGE` SQL text is only safe when those names come from trusted application code — passing a client-supplied table or column name into `BulkInsertAsync`/`BulkUpdateAsync` is a SQL-injection path with no parameterization escape hatch (T-SQL can't parameterize identifiers).
 - A per-entity repository interface (`I{Entity}Repository`) hand-declaring CRUD methods instead of extending the shared `IRepository<T, TKey>` (§6) → the moment `BaseRepository`'s method shapes change, that interface stops matching and no concrete repository compiles.
 - `SearchTable`/`DoFilter`/`DoQuery` (§6a) used without `global using System.Linq.Dynamic.Core;` in scope → `query.Where(filterScript)` silently resolves to plain LINQ's `Where` instead of Dynamic LINQ's string-based overload, and the resulting compiler error doesn't mention a missing `using` at all.
-
----
-
-### What was deliberately left out of this guide
-
-- Any company name, ticket-tracker id scheme, internal service names, real auth provider config, connection strings, or secrets.
-- The full 80+-repository `IUnitOfWork` from the reference project — §6 shows the shape with two example repositories; grow it one entity at a time.
-- The reference project's dynamic advanced-search/filter-builder repository extensions and stored-procedure execution helpers are now included as the optional §6a — add them only when a paged advanced-search endpoint is actually needed, and read the security note on the `…ForProc` builders before using that path.
-- Git branching/commit conventions and a `.claude/rules` + `.claude/skills` governance layer — the reference project also encodes its conventions as auto-loaded Markdown rules for AI coding agents. Worth replicating in a new project once the team has enough conventions worth pinning down, but it's a documentation-process decision, not part of the architecture itself.
