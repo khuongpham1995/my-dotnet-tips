@@ -1,6 +1,6 @@
 # Clean Architecture + CQRS .NET Template Guide
 
-A genericized reference distilled from a production multi-tenant .NET 10 Web API on **SQL Server**. Use this to bootstrap a **brand-new** project with the same architecture — it contains structure, conventions, and file templates, not business logic. Every example below uses placeholder names (`YourApp`, `Product`) — replace with your real solution/company/domain names. §6b/§6c and `SqlSelectBuilder` are SQL-Server-specific (T-SQL, `ROW_NUMBER()`, `Microsoft.Data.SqlClient`) — porting to another database means rewriting their SQL, not just swapping a provider package.
+A genericized reference distilled from a production multi-tenant .NET 10 Web API on **SQL Server**. Use this as an example to bootstrap a **brand-new** project with the same architecture — it contains structure, conventions, and file templates, not business logic. Every example below uses placeholder names (`YourApp`, `Product`) — replace with your real solution/company/domain names.
 
 Hand this file to an agent (or a new teammate) with the instruction: *"Set up a new solution following this guide."*
 
@@ -41,7 +41,7 @@ YourApp.Application/
     Models/                    # ResponseModel<T>, PagedListResponse<T>, shared request/response shapes
     Abstractions/
       Behaviors/                # ValidationBehavior<,> (MediatR pipeline)
-      Messaging/                 # ICommand<T>/IQuery<T> marker interfaces if used
+      Messaging/                 # ICommand<T>/IQuery<T> — see §8
     Mappings/                  # IMapFrom<T> + AutoMapper profile auto-registration
   IoCExtension.cs              # AddApplicationServices(): MediatR, AutoMapper, FluentValidation, pipeline behaviors
   GlobalUsings.cs
@@ -91,7 +91,6 @@ A new end-to-end feature touches **Domain → Application → Infrastructure(.Te
 - **`Async` suffix mandatory** on anything returning `Task`/`ValueTask`.
 - DTOs end in `Dto` (`{Name}RequestDto`, `{Name}ResponseDto`).
 - **Repository classes end in `Repository`, service classes end in `Service`** — keep this regardless of which DI registration approach (§7) you pick, for readability. Under §7a (reflection by name suffix) it's also functionally required — a class with no interface, or a name that doesn't match, silently doesn't get registered. Under §7b (Scrutor + marker interfaces) it's cosmetic; the marker interface is what actually drives registration.
-- No primary constructors — traditional constructor + `_field = field` assignment, for consistency with generated/scaffolded code.
 - Async all the way: never `.Result` / `.Wait()` / `.GetAwaiter().GetResult()` outside `Program.cs`.
 - Propagate `CancellationToken` from controller → MediatR handler → repository call.
 
@@ -201,16 +200,10 @@ public interface IProductRepository : IRepository<Product, int>
 
 ```csharp
 // Infrastructure(.Tenant)/Data/Repositories/BaseRepository.cs
-public abstract class BaseRepository<T, TKey> : IRepository<T, TKey> where T : BaseEntity<TKey>
+public abstract class BaseRepository<T, TKey>(DbContext context) : IRepository<T, TKey> where T : BaseEntity<TKey>
 {
-    protected readonly DbContext _context;
-    protected readonly DbSet<T> _dbSet;
-
-    protected BaseRepository(DbContext context)
-    {
-        _context = context;
-        _dbSet = _context.Set<T>();
-    }
+    protected readonly DbContext _context = context;
+    protected readonly DbSet<T> _dbSet = context.Set<T>();
 
     public async Task<T?> GetByIdAsync(TKey id, CancellationToken cancellationToken = default,
         params Expression<Func<T, object>>[] includeProperties)
@@ -257,21 +250,13 @@ Add this only when a screen genuinely needs open-ended, client-driven filtering/
 
 ```csharp
 // Infrastructure(.Tenant)/Data/Repositories/BaseRepository.cs
-public abstract class BaseRepository<T, TKey> : IRepository<T, TKey> where T : BaseEntity<TKey>
+public abstract class BaseRepository<T, TKey>(DbContext context) : IRepository<T, TKey> where T : BaseEntity<TKey>
 {
-    protected readonly DbContext _context;
-    protected readonly DbSet<T> _dbSet;
-    private readonly List<PropertyType> _tableProperties;
-
-    protected BaseRepository(DbContext context)
-    {
-        _context = context;
-        _dbSet = _context.Set<T>();
-
-        _tableProperties = typeof(T).GetProperties()
-            .Select(p => new PropertyType { Name = p.Name, Type = p.PropertyType })
-            .ToList();
-    }
+    protected readonly DbContext _context = context;
+    protected readonly DbSet<T> _dbSet = context.Set<T>();
+    private readonly List<PropertyType> _tableProperties = typeof(T).GetProperties()
+        .Select(p => new PropertyType { Name = p.Name, Type = p.PropertyType })
+        .ToList();
 
     public Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default)
         => GetQueryable(predicate).AnyAsync(cancellationToken);
@@ -595,22 +580,13 @@ public interface IDatabaseManager
 
 ```csharp
 // Infrastructure(.Tenant)/Services/DatabaseManager.cs
-public class DatabaseManager : IDatabaseManager   // deliberately NOT also IScoped — see the DI registration note below
+// Plain connection string, no EF Core dependency — the DI registration below resolves the tenant-correct
+// one (§12). Deliberately NOT also IScoped — see the DI registration note below.
+public class DatabaseManager(string connectionString, int? commandTimeout = null) : IDatabaseManager
 {
-    private readonly string _connectionString;
-    private readonly int? _commandTimeout;
-
-    // Plain connection string, no EF Core dependency — the DI registration below resolves the
-    // tenant-correct one (§12).
-    public DatabaseManager(string connectionString, int? commandTimeout = null)
-    {
-        _connectionString = connectionString;
-        _commandTimeout = commandTimeout;
-    }
-
     private async Task<T> WithConnectionAsync<T>(Func<IDbConnection, Task<T>> action, CancellationToken cancellationToken)
     {
-        using var connection = new SqlConnection(_connectionString);
+        using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         return await action(connection);
     }
@@ -637,34 +613,34 @@ public class DatabaseManager : IDatabaseManager   // deliberately NOT also IScop
     public Task<IEnumerable<T>> QueryAsync<T>(string sql, object parameters = null,
         CommandType commandType = CommandType.Text, CancellationToken cancellationToken = default)
         => WithConnectionAsync(connection => connection.QueryAsync<T>(
-            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: _commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
+            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
 
     public Task<T> QueryFirstOrDefaultAsync<T>(string sql, object parameters = null,
         CommandType commandType = CommandType.Text, CancellationToken cancellationToken = default)
         => WithConnectionAsync(connection => connection.QueryFirstOrDefaultAsync<T>(
-            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: _commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
+            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
 
     public Task<T> QuerySingleAsync<T>(string sql, object parameters = null,
         CommandType commandType = CommandType.Text, CancellationToken cancellationToken = default)
         => WithConnectionAsync(connection => connection.QuerySingleAsync<T>(
-            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: _commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
+            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
 
     public Task<T> ExecuteScalarAsync<T>(string sql, object parameters = null,
         CommandType commandType = CommandType.Text, CancellationToken cancellationToken = default)
         => WithConnectionAsync(connection => connection.ExecuteScalarAsync<T>(
-            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: _commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
+            new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
 
     public Task<int> ExecuteAsync(string sql, object parameters = null,
         CommandType commandType = CommandType.Text, CancellationToken cancellationToken = default)
         => WithTransactionAsync((connection, transaction) => connection.ExecuteAsync(
-            new CommandDefinition(sql, parameters, transaction, commandType: commandType, commandTimeout: _commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
+            new CommandDefinition(sql, parameters, transaction, commandType: commandType, commandTimeout: commandTimeout, cancellationToken: cancellationToken)), cancellationToken);
 
     public Task<TResult> QueryMultipleAsync<TResult>(string sql, Func<SqlMapper.GridReader, Task<TResult>> map,
         object parameters = null, CommandType commandType = CommandType.Text, CancellationToken cancellationToken = default)
         => WithConnectionAsync(async connection =>
         {
             using var grids = await connection.QueryMultipleAsync(
-                new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: _commandTimeout, cancellationToken: cancellationToken));
+                new CommandDefinition(sql, parameters, commandType: commandType, commandTimeout: commandTimeout, cancellationToken: cancellationToken));
             return await map(grids);
         }, cancellationToken);
 
@@ -673,11 +649,11 @@ public class DatabaseManager : IDatabaseManager   // deliberately NOT also IScop
     public async Task<PagedListResponse<T>> QueryPagedAsync<T>(SqlSelectBuilder query, object parameters = null, CancellationToken cancellationToken = default)
         => await WithConnectionAsync(async connection =>
         {
-            var total = await connection.ExecuteScalarAsync<int>(new CommandDefinition(query.GetCountSql(), parameters, commandTimeout: _commandTimeout, cancellationToken: cancellationToken));
+            var total = await connection.ExecuteScalarAsync<int>(new CommandDefinition(query.GetCountSql(), parameters, commandTimeout: commandTimeout, cancellationToken: cancellationToken));
             var result = new PagedListResponse<T> { Page = query.PageIndex, PageSize = query.PageSize, TotalRecords = total, TotalPages = (int)Math.Ceiling(total / (double)query.PageSize) };
             if (total == 0) return result;
 
-            result.Data = (await connection.QueryAsync<T>(new CommandDefinition(query.GetPagedSql(), parameters, commandTimeout: _commandTimeout, cancellationToken: cancellationToken))).ToList();
+            result.Data = (await connection.QueryAsync<T>(new CommandDefinition(query.GetPagedSql(), parameters, commandTimeout: commandTimeout, cancellationToken: cancellationToken))).ToList();
             return result;
         }, cancellationToken);
 
@@ -714,16 +690,6 @@ public class DatabaseManager : IDatabaseManager   // deliberately NOT also IScop
             "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@viewName)",
             new { viewName }, cancellationToken: cancellationToken);
         return names.ToList();
-    }
-
-    // Builds a DynamicParameters set from explicit ADO.NET parameters (size/DbType/output direction)
-    // instead of an anonymous object — pass the result as the parameters argument above.
-    public static DynamicParameters CreateDynamicParameters(params IDbDataParameter[] parameters)
-    {
-        var dynamicParameters = new DynamicParameters();
-        foreach (var p in parameters)
-            dynamicParameters.Add(p.ParameterName, p.Value, p.DbType, p.Direction, p.Size, p.Precision, p.Scale);
-        return dynamicParameters;
     }
 }
 ```
@@ -844,17 +810,8 @@ public interface IBulkManager
 
 ```csharp
 // Infrastructure(.Tenant)/Services/BulkManager.cs
-public class BulkManager : IBulkManager
+public class BulkManager(string connectionString, int? bulkCopyTimeout = null) : IBulkManager
 {
-    private readonly string _connectionString;
-    private readonly int? _bulkCopyTimeout;
-
-    public BulkManager(string connectionString, int? bulkCopyTimeout = null)
-    {
-        _connectionString = connectionString;
-        _bulkCopyTimeout = bulkCopyTimeout;
-    }
-
     public Task BulkInsertAsync(DataTable dataTable, string tableName, string keyColumnName, CancellationToken cancellationToken = default)
         => UpsertAsync(dataTable, tableName, BuildInsertMergeSql(dataTable, tableName, keyColumnName), cancellationToken);
 
@@ -865,7 +822,7 @@ public class BulkManager : IBulkManager
     // table, drop the temp table — one transaction. On failure, roll back and let it propagate (§10).
     private async Task UpsertAsync(DataTable dataTable, string tableName, string mergeSql, CancellationToken cancellationToken)
     {
-        using var connection = new SqlConnection(_connectionString);
+        using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         using var transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted);
         try
@@ -876,7 +833,7 @@ public class BulkManager : IBulkManager
             using (var bulk = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction))
             {
                 bulk.DestinationTableName = $"#{tableName}";
-                bulk.BulkCopyTimeout = _bulkCopyTimeout ?? bulk.BulkCopyTimeout;
+                bulk.BulkCopyTimeout = bulkCopyTimeout ?? bulk.BulkCopyTimeout;
                 bulk.BatchSize = Math.Min(dataTable.Rows.Count, 5000); // capped — one unbounded batch on a huge import is hard to cancel
                 await bulk.WriteToServerAsync(dataTable, cancellationToken);
             }
@@ -962,19 +919,12 @@ public interface IUnitOfWork : IDisposable
 
 ```csharp
 // Infrastructure(.Tenant)/Data/Repositories/UnitOfWork.cs
-public class UnitOfWork : IUnitOfWork
+public class UnitOfWork(ApplicationDbContext context, IProductRepository products, ICategoryRepository categories) : IUnitOfWork
 {
-    private readonly ApplicationDbContext _context;
-    public UnitOfWork(ApplicationDbContext context,
-        IProductRepository products, ICategoryRepository categories)
-    {
-        _context = context;
-        Products = products;
-        Categories = categories;
-    }
+    private readonly ApplicationDbContext _context = context;
 
-    public IProductRepository Products { get; }
-    public ICategoryRepository Categories { get; }
+    public IProductRepository Products { get; } = products;
+    public ICategoryRepository Categories { get; } = categories;
 
     public async Task<bool> SaveChangesAsync(CancellationToken cancellationToken = default)
     {
@@ -1078,10 +1028,7 @@ public static IServiceCollection AddInfrastructureTenantServices(this IServiceCo
 
 ```csharp
 // Infrastructure(.Tenant)/Data/Repositories/ProductRepository.cs
-public class ProductRepository : BaseRepository<Product, int>, IProductRepository, IScoped
-{
-    public ProductRepository(ApplicationDbContext context) : base(context) { }
-}
+public class ProductRepository(ApplicationDbContext context) : BaseRepository<Product, int>(context), IProductRepository, IScoped;
 ```
 
 Trade-offs vs 7a:
@@ -1091,32 +1038,36 @@ Trade-offs vs 7a:
 
 ## 8. CQRS feature layout
 
+`ICommand<TResponse>`/`IQuery<TResponse>` mark a request as a write or a read — both just extend MediatR's `IRequest<TResponse>`, so nothing about dispatch changes. The point is letting a pipeline behavior target one and not the other (e.g. a transaction-wrapping behavior on `ICommand<TResponse>` only, a caching behavior on `IQuery<TResponse>` only) — `ValidationBehavior` (§9) applies to both, so it stays constrained to plain `IRequest<TResponse>`.
+
+```csharp
+// Application/Common/Abstractions/Messaging/ICommand.cs
+public interface ICommand<TResponse> : IRequest<TResponse>;
+```
+
+```csharp
+// Application/Common/Abstractions/Messaging/IQuery.cs
+public interface IQuery<TResponse> : IRequest<TResponse>;
+```
+
 One folder per command/query. Example — `Products/Commands/CreateProduct/`:
 
 ```csharp
 // CreateProductCommand.cs
 namespace YourApp.Application.Products.Commands.CreateProduct;
 
-public sealed record CreateProductCommand(CreateProductRequestDto Request) : IRequest<int>;
+public sealed record CreateProductCommand(CreateProductRequestDto Request) : ICommand<int>;
 
-public class CreateProductCommandHandler : IRequestHandler<CreateProductCommand, int>
+public class CreateProductCommandHandler(IUnitOfWork unitOfWork, IMapper mapper, ILogger<CreateProductCommandHandler> logger)
+    : IRequestHandler<CreateProductCommand, int>
 {
-    private readonly IUnitOfWork _unitOfWork;
-    private readonly IMapper _mapper;
-
-    public CreateProductCommandHandler(IUnitOfWork unitOfWork, IMapper mapper)
-    {
-        _unitOfWork = unitOfWork;
-        _mapper = mapper;
-    }
-
     public async Task<int> Handle(CreateProductCommand request, CancellationToken cancellationToken)
     {
         try
         {
-            var entity = _mapper.Map<Product>(request.Request);
-            await _unitOfWork.Products.AddAsync(entity, cancellationToken);
-            await _unitOfWork.SaveChangesAsync(cancellationToken);
+            var entity = mapper.Map<Product>(request.Request);
+            await unitOfWork.Products.AddAsync(entity, cancellationToken);
+            await unitOfWork.SaveChangesAsync(cancellationToken);
             return entity.Id;
         }
         catch (NotFoundException) { throw; }
@@ -1128,7 +1079,7 @@ public class CreateProductCommandHandler : IRequestHandler<CreateProductCommand,
             // rethrow/wrap exceptions you can attribute to a known client-facing
             // cause; let anything else propagate so ExceptionHandlerMiddleware's
             // generic 500 (message hidden, full detail logged) applies instead.
-            Log.Error(ex, "Failed to create product");
+            logger.LogError(ex, "Failed to create product");
             throw;
         }
     }
@@ -1160,7 +1111,7 @@ public class CreateProductValidator : AbstractValidator<CreateProductCommand>
 }
 ```
 
-Queries follow the same shape (`GetProductQuery` + handler returning a DTO, no validator needed unless the query has meaningful input constraints).
+Queries follow the same shape with `IQuery<TResponse>` instead of `ICommand<TResponse>` (`GetProductQuery : IQuery<ProductDto>` + handler returning a DTO, no validator needed unless the query has meaningful input constraints).
 
 `IMapFrom<TEntity>` on a DTO auto-registers an AutoMapper profile — no hand-written `Profile` class needed for the common case.
 
@@ -1179,16 +1130,13 @@ services.AddValidatorsFromAssembly(typeof(IoCExtension).Assembly);
 ```
 
 ```csharp
-public class ValidationBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, TResponse>
+public class ValidationBehavior<TRequest, TResponse>(IEnumerable<IValidator<TRequest>> validators) : IPipelineBehavior<TRequest, TResponse>
     where TRequest : IRequest<TResponse>
 {
-    private readonly IEnumerable<IValidator<TRequest>> _validators;
-    public ValidationBehavior(IEnumerable<IValidator<TRequest>> validators) => _validators = validators;
-
     public async Task<TResponse> Handle(TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken cancellationToken)
     {
         var context = new ValidationContext<TRequest>(request);
-        var failures = (await Task.WhenAll(_validators.Select(v => v.ValidateAsync(context, cancellationToken))))
+        var failures = (await Task.WhenAll(validators.Select(v => v.ValidateAsync(context, cancellationToken))))
             .SelectMany(r => r.Errors).Select(e => e.ErrorMessage).ToList();
 
         if (failures.Count > 0)
@@ -1291,17 +1239,14 @@ public class BaseController : ControllerBase
 // Controllers/ProductsController.cs
 [Route("Products")]
 [Authorize(AuthenticationSchemes = "Bearer")]
-public class ProductsController : BaseController
+public class ProductsController(ISender sender) : BaseController
 {
-    private readonly ISender _sender;
-    public ProductsController(ISender sender) => _sender = sender;
-
     [HttpPost]
     [Authorize(Policy = "Products.Create")]
     public async Task<IActionResult> Create(CreateProductRequestDto request, CancellationToken cancellationToken)
     {
         if (!ModelState.IsValid) return Failure();
-        var id = await _sender.Send(new CreateProductCommand(request), cancellationToken);
+        var id = await sender.Send(new CreateProductCommand(request), cancellationToken);
         return CreatedResult(id, $"/Products/{id}");
     }
 }
@@ -1336,9 +1281,10 @@ If the new project is single-tenant, drop `Infrastructure.Tenant` as a separate 
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Logging (Serilog bootstrap logger, then full config)
-// 2. Authentication (OAuth2/OIDC, or whatever the project's IdP is) + policy-based authorization
-//    — build named policies from config, not hardcoded in controllers
+builder.Host.UseSerilog((context, config) => config.ReadFrom.Configuration(context.Configuration)); // app code logs via ILogger<T>, never Serilog.Log directly
+
+// Authentication (OAuth2/OIDC, or whatever the project's IdP is) + policy-based authorization
+// — build named policies from config, not hardcoded in controllers
 builder.Services.AddHttpContextAccessor();          // required if ApplicationDbContext resolves tenant from HttpContext.Items (§12)
 builder.Services.AddApplicationServices();          // Application/IoCExtension.cs
 builder.Services.AddInfrastructureServices(...);     // master/non-tenant, if applicable
@@ -1381,7 +1327,7 @@ Order matters, and **middleware registered after `MapControllers()` never runs f
 | Micro-ORM | `Dapper` | Only if using §6b's `DatabaseManager` / §6c's `BulkManager` |
 | SQL Server client | `Microsoft.Data.SqlClient` | `SqlConnection`/`SqlBulkCopy` — needed by §6b/§6c |
 | Dynamic LINQ | `System.Linq.Dynamic.Core` | Only if using §6a's `SearchTable`/`DoFilter`/`DoQuery` (string-based `Where`/`OrderBy`); pin a recent version — it has had past CVEs around unrestricted type resolution |
-| Logging | `Serilog` (+ `Serilog.AspNetCore`) | Structured properties, never string-interpolate into the template |
+| Logging | `Microsoft.Extensions.Logging.Abstractions` | Inject `ILogger<T>`; wire whatever provider/sink in `Program.cs` |
 | JSON | Pick **one**: `System.Text.Json` (default) or `Newtonsoft.Json` — don't mix | The reference project uses Newtonsoft; a fresh project should default to `System.Text.Json` unless there's a reason not to |
 | API docs | `Swashbuckle.AspNetCore` | JWT bearer security scheme |
 | Background jobs | `Hangfire` (+ SQL Server storage) | Only if the project needs scheduled/background work |
@@ -1399,7 +1345,7 @@ Don't introduce a Result-pattern library (`OneOf`, `FluentResults`, `ErrorOr`) �
 4. **Repository implementation** → `Infrastructure(.Tenant)/Data/Repositories/{Entity}Repository.cs` (extends `BaseRepository<T,TKey>`, name ends `Repository`).
 5. **Add to `IUnitOfWork` + `UnitOfWork`.**
 6. **DTOs** → `Application/{Feature}/{Entity}Dto.cs` or per-command under `Commands/{Name}/`.
-7. **Command/Query** → `Application/{Feature}/Commands|Queries/{Name}/{Name}Command.cs` + handler.
+7. **Command/Query** → `Application/{Feature}/Commands|Queries/{Name}/{Name}Command.cs|Query.cs` + handler.
 8. **Validator** in the same folder.
 9. **Service interface** (only if business logic doesn't belong in the handler) → `Application/Common/Services/I{Feature}Service.cs`.
 10. **Service implementation** → `Infrastructure(.Tenant)/Services/{Feature}Service.cs`.
