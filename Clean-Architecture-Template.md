@@ -42,8 +42,8 @@ YourApp.Application/
     Abstractions/
       Behaviors/                # ValidationBehavior<,> (MediatR pipeline)
       Messaging/                 # ICommand<T>/IQuery<T> — see §8
-    Mappings/                  # IMapFrom<T> + AutoMapper profile auto-registration
-  IoCExtension.cs              # AddApplicationServices(): MediatR, AutoMapper, FluentValidation, pipeline behaviors
+    Mappings/                  # Mapster IRegister mapping configs, scanned once at startup
+  IoCExtension.cs              # AddApplicationServices(): MediatR, Mapster, FluentValidation, pipeline behaviors
   GlobalUsings.cs
 YourApp.Infrastructure/            # master / non-tenant DB (only needed if multi-tenant)
   Data/                       # master DbContext + initialiser/seed
@@ -1058,7 +1058,7 @@ namespace YourApp.Application.Products.Commands.CreateProduct;
 
 public sealed record CreateProductCommand(CreateProductRequestDto Request) : ICommand<int>;
 
-public class CreateProductCommandHandler(IUnitOfWork unitOfWork, IMapper mapper, ILogger<CreateProductCommandHandler> logger)
+public class CreateProductCommandHandler(IUnitOfWork unitOfWork, MapsterMapper.IMapper mapper, ILogger<CreateProductCommandHandler> logger)
     : IRequestHandler<CreateProductCommand, int>
 {
     public async Task<int> Handle(CreateProductCommand request, CancellationToken cancellationToken)
@@ -1090,7 +1090,7 @@ public class CreateProductCommandHandler(IUnitOfWork unitOfWork, IMapper mapper,
 // CreateProductRequestDto.cs
 namespace YourApp.Application.Products.Commands.CreateProduct;
 
-public class CreateProductRequestDto : IMapFrom<Product>
+public class CreateProductRequestDto
 {
     public string Code { get; set; }
     public string Name { get; set; }
@@ -1113,7 +1113,62 @@ public class CreateProductValidator : AbstractValidator<CreateProductCommand>
 
 Queries follow the same shape with `IQuery<TResponse>` instead of `ICommand<TResponse>` (`GetProductQuery : IQuery<ProductDto>` + handler returning a DTO, no validator needed unless the query has meaningful input constraints).
 
-`IMapFrom<TEntity>` on a DTO auto-registers an AutoMapper profile — no hand-written `Profile` class needed for the common case.
+### Mapster mapping convention
+
+Keep DTOs as plain classes/records. Put mapping rules in `Application/Common/Mappings/` as Mapster `IRegister` implementations, then scan the Application assembly once during DI setup. This keeps mapping configuration explicit and prevents DTOs from carrying mapper-specific marker interfaces.
+
+```csharp
+// Application/Common/Mappings/ProductMapping.cs
+using Mapster;
+using YourApp.Application.Products.Commands.CreateProduct;
+using YourApp.Domain.Entities;
+
+namespace YourApp.Application.Common.Mappings;
+
+public sealed class ProductMapping : IRegister
+{
+    public void Register(TypeAdapterConfig config)
+    {
+        config.NewConfig<CreateProductRequestDto, Product>();
+
+        // Add non-conventional mappings explicitly, e.g.:
+        // config.NewConfig<Product, ProductDto>()
+        //     .Map(dest => dest.CategoryName, src => src.Category.Name);
+    }
+}
+```
+
+Register one application-owned `TypeAdapterConfig` instance and let Mapster scan all `IRegister` classes:
+
+```csharp
+// Application/IoCExtension.cs
+using Mapster;
+
+public static IServiceCollection AddApplicationServices(this IServiceCollection services)
+{
+    var assembly = typeof(IoCExtension).Assembly;
+
+    var mapsterConfig = new TypeAdapterConfig();
+    mapsterConfig.Scan(assembly);
+    mapsterConfig.Compile(); // fail early if a registered mapping cannot compile
+
+    services.AddSingleton(mapsterConfig);
+    services.AddMapster(); // registers MapsterMapper.IMapper
+
+    // MediatR / FluentValidation / pipeline behavior registration continues here.
+    return services;
+}
+```
+
+Handlers use the injected `MapsterMapper.IMapper`:
+
+```csharp
+var entity = mapper.Map<Product>(request.Request);
+```
+
+Prefer the injected mapper over parameterless `request.Adapt<T>()` in handlers. Parameterless `Adapt<T>()` uses Mapster's global settings, while this guide deliberately owns a DI-registered `TypeAdapterConfig`; mixing the two makes it easy for a mapping to work with one configuration and fail with the other.
+
+For simple same-name properties Mapster can map by convention, but still add an `IRegister` mapping when the pair is part of an application contract or needs custom rules. Keep mapping expressions pure; if a transformation needs business logic or I/O, do that in a service/handler instead of hiding it inside the mapper.
 
 ## 9. Validation pipeline
 
@@ -1320,7 +1375,7 @@ Order matters, and **middleware registered after `MapControllers()` never runs f
 | Concern | Package | Notes |
 |---|---|---|
 | CQRS mediator | `MediatR` | Register the open `ValidationBehavior<,>`. **License:** v13+ (2025) is commercial (paid per-organization); pin to the last Apache-2.0 release (12.x) or budget for a license before adopting later versions |
-| DTO mapping | `AutoMapper` | `IMapFrom<T>` convention for profile auto-discovery. **License:** same commercial transition as MediatR (same author) — pin an Apache-2.0-era version or budget for a license |
+| DTO mapping | `Mapster` + `Mapster.DependencyInjection` | Use `IRegister` + `TypeAdapterConfig.Scan(...)`; inject `MapsterMapper.IMapper` in handlers. Keep both packages on the same pinned stable version. **License:** MIT |
 | Validation | `FluentValidation` | Validators auto-registered from assembly |
 | ORM | `Microsoft.EntityFrameworkCore` + `.SqlServer` + `.Design` | Target is SQL Server; §6b/§6c's raw SQL is T-SQL-specific regardless of EF provider |
 | DI assembly scanning | `Scrutor` | Only if using §7b's marker-interface registration instead of §7a's reflection scan |
@@ -1345,16 +1400,18 @@ Don't introduce a Result-pattern library (`OneOf`, `FluentResults`, `ErrorOr`) �
 4. **Repository implementation** → `Infrastructure(.Tenant)/Data/Repositories/{Entity}Repository.cs` (extends `BaseRepository<T,TKey>`, name ends `Repository`).
 5. **Add to `IUnitOfWork` + `UnitOfWork`.**
 6. **DTOs** → `Application/{Feature}/{Entity}Dto.cs` or per-command under `Commands/{Name}/`.
-7. **Command/Query** → `Application/{Feature}/Commands|Queries/{Name}/{Name}Command.cs|Query.cs` + handler.
-8. **Validator** in the same folder.
-9. **Service interface** (only if business logic doesn't belong in the handler) → `Application/Common/Services/I{Feature}Service.cs`.
-10. **Service implementation** → `Infrastructure(.Tenant)/Services/{Feature}Service.cs`.
-11. **Controller** → `WebAPI/Controllers/{Feature}Controller.cs` (inherits `BaseController`, dispatches via `ISender`, returns through `Success`/`Failure`/`CreatedResult`).
-12. **Migration** → `dotnet ef migrations add Add{Entity} --context ApplicationDbContext` (or the PMC equivalent).
+7. **Mapster mapping** → add/update an `IRegister` implementation under `Application/Common/Mappings/` for each application-contract mapping pair that needs explicit configuration.
+8. **Command/Query** → `Application/{Feature}/Commands|Queries/{Name}/{Name}Command.cs|Query.cs` + handler; inject `MapsterMapper.IMapper` when mapping is needed.
+9. **Validator** in the same folder.
+10. **Service interface** (only if business logic doesn't belong in the handler) → `Application/Common/Services/I{Feature}Service.cs`.
+11. **Service implementation** → `Infrastructure(.Tenant)/Services/{Feature}Service.cs`.
+12. **Controller** → `WebAPI/Controllers/{Feature}Controller.cs` (inherits `BaseController`, dispatches via `ISender`, returns through `Success`/`Failure`/`CreatedResult`).
+13. **Migration** → `dotnet ef migrations add Add{Entity} --context ApplicationDbContext` (or the PMC equivalent).
 
 ## 16. Common pitfalls to flag in review
 
 - Handler injects `DbContext` directly instead of `IUnitOfWork`.
+- Mapster mapping config is added without implementing `IRegister` → `TypeAdapterConfig.Scan(...)` never discovers it; or a handler uses parameterless `Adapt<T>()` and silently bypasses the DI-owned `TypeAdapterConfig` used by this guide.
 - Write command has no validator → `ValidationBehavior` silently doesn't run (no `IValidator<T>` registered for it).
 - Repository/service class name doesn't end in `Repository`/`Service` (§7a) or is missing its lifetime marker interface (§7b) → DI auto-registration skips it silently.
 - New repository not added to `IUnitOfWork`/`UnitOfWork` → handlers can't resolve it.
