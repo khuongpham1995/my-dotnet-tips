@@ -4,7 +4,7 @@ A solution can have the right folders and still have the wrong dependencies. An 
 
 **Architecture tests turn selected design decisions into executable checks.** This guide adds three practical NetArchTest rules to the layering used in the [Clean Architecture + CQRS template](Clean-Architecture-Template.md): protect the Domain, check repository dependencies, and keep Application independent of implementation details.
 
-The examples use `YourApp` and an `Order` aggregate as placeholders. They target **.NET 10, xUnit v2, and `NetArchTest.Rules` 1.3.2**. Replace project and namespace names with your own. These are rules for this architecture, not a universal definition of Domain-Driven Design (DDD).
+The examples use `YourApp` and an `Order` aggregate as placeholders. They target **.NET 10, xUnit v2, Shouldly 4.3.0, and `NetArchTest.Rules` 1.3.2**. Replace project and namespace names with your own. These are rules for this architecture, not a universal definition of Domain-Driven Design (DDD).
 
 ---
 
@@ -51,6 +51,7 @@ Run these commands from the solution directory:
 ```bash
 dotnet new xunit -n YourApp.ArchitectureTests --framework net10.0
 dotnet add YourApp.ArchitectureTests package NetArchTest.Rules --version 1.3.2
+dotnet add YourApp.ArchitectureTests package Shouldly --version 4.3.0
 dotnet add YourApp.ArchitectureTests reference YourApp.Domain/YourApp.Domain.csproj
 dotnet add YourApp.ArchitectureTests reference YourApp.Application/YourApp.Application.csproj
 dotnet add YourApp.ArchitectureTests reference YourApp.Infrastructure/YourApp.Infrastructure.csproj
@@ -87,13 +88,15 @@ public static class AssemblyMarker { }
 
 ### Make failures useful
 
+Use xUnit for test discovery and execution, and Shouldly for assertions. Test methods follow `Method_WhenCondition_ShouldExpectedBehavior`; here, `GetResult` is the method under test and the `When` clause identifies the types being analyzed.
+
 Add this helper to the test project. It includes the offending type names in the assertion message:
 
 ```csharp
 // YourApp.ArchitectureTests/ArchitectureAssert.cs
 using System;
 using NetArchTest.Rules;
-using Xunit;
+using Shouldly;
 
 namespace YourApp.ArchitectureTests;
 
@@ -103,8 +106,7 @@ internal static class ArchitectureAssert
     {
         var failingTypes = result.FailingTypeNames ?? Array.Empty<string>();
 
-        Assert.True(
-            result.IsSuccessful,
+        result.IsSuccessful.ShouldBeTrue(
             $"{rule}{Environment.NewLine}Failing types: " +
             string.Join(", ", failingTypes));
     }
@@ -128,7 +130,7 @@ namespace YourApp.ArchitectureTests;
 public sealed class DomainDependencyTests
 {
     [Fact]
-    public void Domain_should_not_depend_on_outer_layers_or_io_technologies()
+    public void GetResult_WhenAnalyzingDomain_ShouldHaveNoForbiddenDependencies()
     {
         var result = Types.InAssembly(typeof(DomainMarker).Assembly)
             .ShouldNot()
@@ -161,6 +163,7 @@ This is a **denylist**, not proof that Domain has no external dependencies. It c
 ```csharp
 // YourApp.ArchitectureTests/RepositoryDependencyTests.cs
 using NetArchTest.Rules;
+using Shouldly;
 using Xunit;
 using InfrastructureMarker = YourApp.Infrastructure.AssemblyMarker;
 
@@ -169,7 +172,7 @@ namespace YourApp.ArchitectureTests;
 public sealed class RepositoryDependencyTests
 {
     [Fact]
-    public void Concrete_repositories_should_depend_on_domain()
+    public void GetResult_WhenAnalyzingConcreteRepositories_ShouldHaveDomainDependencies()
     {
         var repositories = Types
             .InAssembly(typeof(InfrastructureMarker).Assembly)
@@ -177,7 +180,8 @@ public sealed class RepositoryDependencyTests
             .And().AreNotAbstract()
             .And().HaveNameEndingWith("Repository");
 
-        Assert.NotEmpty(repositories.GetTypes());
+        repositories.GetTypes().ShouldNotBeEmpty(
+            "The repository selector must match at least one concrete repository.");
 
         var result = repositories
             .Should()
@@ -261,7 +265,7 @@ namespace YourApp.ArchitectureTests;
 public sealed class ApplicationDependencyTests
 {
     [Fact]
-    public void Application_should_not_depend_on_implementation_details()
+    public void GetResult_WhenAnalyzingApplication_ShouldHaveNoImplementationDependencies()
     {
         var result = Types.InAssembly(typeof(ApplicationMarker).Assembly)
             .ShouldNot()
@@ -322,4 +326,5 @@ Start with rules the team can explain and defend. Keep them close to the code, r
 - [Clean Architecture + CQRS template in this repository](Clean-Architecture-Template.md)
 - [NetArchTest documentation and examples](https://github.com/BenMorris/NetArchTest)
 - [NetArchTest.Rules 1.3.2 on NuGet](https://www.nuget.org/packages/NetArchTest.Rules/1.3.2)
+- [Shouldly 4.3.0 on NuGet](https://www.nuget.org/packages/Shouldly/4.3.0)
 - [Microsoft: design the infrastructure persistence layer](https://learn.microsoft.com/en-us/dotnet/architecture/microservices/microservice-ddd-cqrs-patterns/infrastructure-persistence-layer-design)
